@@ -1,6 +1,7 @@
 1 ICON "res\\TrayAudio.ico"
 1 24 "res\\TrayAudio.manifest"
 2 RCDATA "build\\MiSans-Regular.ttf"
+3 RCDATA "build\\MiSans-License.pdf"
 
 1 VERSIONINFO
 FILEVERSION 1,5,2,0

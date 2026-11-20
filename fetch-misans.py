@@ -1,13 +1,15 @@
-"""Read the unmodified regular TrueType face from the official Xiaomi archive."""
+"""Download the unmodified MiSans Regular face and its license from Xiaomi."""
 
 import io
 from pathlib import Path
 import re
 import sys
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 from zipfile import ZipFile
 
 URL = "https://hyperos.mi.com/font-download/MiSans.zip"
+LICENSE_URL = "https://hyperos.mi.com/font-download/" + quote("MiSans字体知识产权许可协议.pdf")
 
 
 def read_range(byte_range):
@@ -58,8 +60,16 @@ class FontArchive:
 
 
 if __name__ == "__main__":
+    output = Path(sys.argv[1])
+    license_path = output.with_name("MiSans-License.pdf")
+    if not license_path.exists():
+        with urlopen(LICENSE_URL, timeout=45) as response:
+            agreement = response.read()
+        if not agreement.startswith(b"%PDF-"):
+            raise OSError("Xiaomi's MiSans license download did not return a PDF")
+        license_path.write_bytes(agreement)
+
     with ZipFile(FontArchive()) as archive:
         entry, = [name for name in archive.namelist() if name.rsplit("/", 1)[-1] == "MiSans-Regular.ttf"]
-        output = Path(sys.argv[1])
         output.write_bytes(archive.read(entry))
         print(f"Embedded MiSans Regular: {output.stat().st_size:,} bytes")
