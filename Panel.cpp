@@ -18,7 +18,7 @@
 
 namespace {
 constexpr wchar_t AppName[] = L"TrayAudio";
-constexpr wchar_t AppVersion[] = L"v1.5.2";
+constexpr wchar_t AppVersion[] = L"v1.5.3";
 constexpr wchar_t WindowClass[] = L"TrayAudio.Panel";
 constexpr wchar_t StartupKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t OptionsKey[] = L"Software\\TrayAudio";
@@ -38,6 +38,19 @@ constexpr int PanelHeight = 548;
 constexpr int MinPanelWidth = 320;
 constexpr int MinPanelHeight = 430;
 constexpr int PanelCorner = 32;
+constexpr int GuideTop = 170, GuideRowHeight = 67;
+constexpr PCWSTR Guide[][3]{
+    {L"切换和固定设备", L"「混合」选输出，「语音」选输入。",
+                        L"点设备名称切换，点右侧图钉固定常用设备。"},
+    {L"调节应用音量", L"在「混合」拖动系统或应用的音量滑块。",
+                      L"点击扬声器图标静音，应用设置会自动保存。"},
+    {L"测试麦克风", L"在「语音」点「开始测试」，从默认输出听。",
+                    L"点「停止测试」、换页或切换设备即可。"},
+    {L"调整外观和开机自启", L"右键托盘图标设置配色、透明度和自启。",
+                            L"透明度最高 80%，首次运行会启用开机自启。"},
+    {L"摆放面板", L"拖动标题栏移动，拖动边缘调整大小。",
+                  L"点右上角图钉让面板保持打开。"},
+};
 
 constexpr COLORREF Color(unsigned hex) {
     return RGB((hex >> 16) & 255, (hex >> 8) & 255, hex & 255);
@@ -521,7 +534,7 @@ private:
             InvalidateRect(window_, nullptr, FALSE);
             return 0;
         case WM_MOUSEWHEEL:
-            if (!about_ && !Interacting()) {
+            if (!Interacting()) {
                 wheel_ += GET_WHEEL_DELTA_WPARAM(wParam);
                 ScrollBy(-wheel_ / WHEEL_DELTA * Px(54));
                 wheel_ %= WHEEL_DELTA;
@@ -703,7 +716,14 @@ private:
     }
 
     void NavigateAbout(bool open) {
-        if (open) monitor_.Stop();
+        if (open == about_) return;
+        if (open) {
+            monitor_.Stop();
+            audioScroll_ = scroll_;
+            scroll_ = 0;
+        } else {
+            scroll_ = audioScroll_;
+        }
         about_ = open;
         hovered_ = focused_ = -1;
         keyFocus_ = false;
@@ -916,11 +936,14 @@ private:
     int AppTop() const { return OutputBottom() + Px(84) - scroll_; }
 
     RECT ContentViewport() const {
-        return {Px(20), Px(143), width_ - Px(13), std::max(Px(143), height_ - Px(38))};
+        const int top = Px(about_ ? 56 : 143);
+        return {Px(20), top, width_ - Px(13), std::max(top, height_ - Px(38))};
     }
 
     int ScrollLimit() const {
         const RECT list = ContentViewport();
+        if (about_) return std::max(0, Px(GuideTop + GuideRowHeight * static_cast<int>(std::size(Guide))) -
+                                       static_cast<int>(list.bottom));
         const int appHeight = view_.apps.empty() ? Px(44) : Px(61) * static_cast<int>(view_.apps.size());
         const int contentBottom = voice_ ? VoiceInputTop() + Px(44) : OutputBottom() + Px(84) + appHeight;
         return std::max(0, contentBottom - static_cast<int>(list.bottom));
@@ -940,10 +963,13 @@ private:
         if (about_) controls_.push_back({Action::Back, Box(22, 12, 54, 44)});
         controls_.push_back({Action::Pin, {width_ - Px(85), Px(12), width_ - Px(53), Px(44)}});
         controls_.push_back({Action::Close, {width_ - Px(48), Px(12), width_ - Px(16), Px(44)}});
-        if (about_) return;
+        scroll_ = std::clamp(scroll_, 0, ScrollLimit());
+        if (about_) {
+            LayoutScrollbar();
+            return;
+        }
         controls_.push_back({Action::Mix, Box(25, 58, 96, 89)});
         controls_.push_back({Action::Voice, Box(99, 58, 170, 89)});
-        scroll_ = std::clamp(scroll_, 0, ScrollLimit());
         const auto slot = voice_ ? DeviceSlot::Input : DeviceSlot::Output;
         controls_.push_back({Action::DeviceList, DeviceListRect(), -1,
                              !Choice(view_, slot).list.empty() || QuickList(slot).showAll, slot});
@@ -970,12 +996,16 @@ private:
                 controls_.push_back({Action::Volume, {Px(98), y + Px(24), width_ - Px(70), y + Px(52)}, index});
             }
         }
+        LayoutScrollbar();
+        if (focused_ >= static_cast<int>(controls_.size())) focused_ = -1;
+        if (hovered_ >= static_cast<int>(controls_.size())) hovered_ = -1;
+    }
+
+    void LayoutScrollbar() {
         const RECT viewport = ContentViewport();
         if (ScrollLimit() > 0)
             controls_.push_back({Action::Scroll, {width_ - Px(17), viewport.top,
-                                                  width_ - Px(7), viewport.bottom}});
-        if (focused_ >= static_cast<int>(controls_.size())) focused_ = -1;
-        if (hovered_ >= static_cast<int>(controls_.size())) hovered_ = -1;
+                                                 width_ - Px(7), viewport.bottom}});
     }
 
     void LayoutQuickDevices(DeviceSlot slot, int top, int edge) {
@@ -1518,20 +1548,29 @@ private:
 
     void DrawAbout(const DrawContext& context) {
         const auto& colors = Colors();
-        const int top = std::max(Px(64), (height_ - Px(219)) / 2);
-        const int center = width_ / 2;
+        const RECT viewport = ContentViewport();
+        const int previous = SaveDC(context.dc);
+        IntersectClipRect(context.dc, viewport.left, viewport.top, viewport.right, viewport.bottom);
+        const int top = Px(59) - scroll_;
         const int left = Px(22);
         const int right = width_ - left;
-        Round(context.dc, {left, top, right, top + Px(219)}, 20, colors.card, colors.cardBorder);
-        Round(context.dc, {center - Px(24), top + Px(23), center + Px(24), top + Px(71)}, 15, colors.accent);
-        Symbol(context.dc, center, top + Px(47), Glyph::Speaker, colors.accentInk, 27);
-        Label(context, {left, top + Px(78), right, top + Px(115)}, AppName, aboutName_, colors.text, DT_CENTER);
-        Label(context, {left, top + Px(117), right, top + Px(139)}, AppVersion, small_, colors.secondary, DT_CENTER);
-        Label(context, {left, top + Px(142), right, top + Px(164)},
-              L"Windows 托盘音频控制", normal_, colors.text, DT_CENTER);
-        Fill(context.dc, {left + Px(24), top + Px(178), right - Px(24), top + Px(178) + 1}, colors.cardBorder);
-        Label(context, {left, top + Px(185), right, top + Px(210)},
-              L"界面字体 · 小米 MiSans", small_, colors.secondary, DT_CENTER);
+        Round(context.dc, {left, top, right, top + Px(75)}, 16, colors.card, colors.cardBorder);
+        Round(context.dc, {left + Px(13), top + Px(16), left + Px(56), top + Px(59)}, 13, colors.accent);
+        Symbol(context.dc, left + Px(34), top + Px(37), Glyph::Speaker, colors.accentInk, 23);
+        Label(context, {left + Px(68), top + Px(10), right - Px(12), top + Px(44)}, AppName, aboutName_);
+        Label(context, {left + Px(69), top + Px(45), right - Px(12), top + Px(64)},
+              std::wstring(AppVersion) + L"  ·  界面字体 小米 MiSans", small_, colors.secondary);
+
+        Label(context, {left, Px(144) - scroll_, right, Px(166) - scroll_}, L"使用说明", medium_);
+        int y = Px(GuideTop) - scroll_;
+        for (const auto& row : Guide) {
+            Round(context.dc, {left, y, right, y + Px(61)}, 12, colors.card, colors.cardBorder);
+            Label(context, {left + Px(12), y + Px(5), right - Px(12), y + Px(25)}, row[0], medium_);
+            Label(context, {left + Px(12), y + Px(25), right - Px(12), y + Px(42)}, row[1], small_, colors.secondary);
+            Label(context, {left + Px(12), y + Px(42), right - Px(12), y + Px(59)}, row[2], small_, colors.secondary);
+            y += Px(GuideRowHeight);
+        }
+        RestoreDC(context.dc, previous);
     }
 
     void DrawContent(const DrawContext& context) {
@@ -1757,7 +1796,7 @@ private:
     UINT dpi_ = 96;
     HANDLE fontResource_ = nullptr;
     HFONT normal_ = nullptr, medium_ = nullptr, small_ = nullptr, title_ = nullptr, aboutName_ = nullptr;
-    int width_ = 0, height_ = 0, scroll_ = 0, wheel_ = 0;
+    int width_ = 0, height_ = 0, scroll_ = 0, wheel_ = 0, audioScroll_ = 0;
     int hovered_ = -1, focused_ = -1, pressed_ = -1;
     bool voice_ = false, about_ = false, pinned_ = false, menuOpen_ = false, glassAttempted_ = false;
     bool fontAttempted_ = false;
