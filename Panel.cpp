@@ -18,7 +18,7 @@
 
 namespace {
 constexpr wchar_t AppName[] = L"TrayAudio";
-constexpr wchar_t AppVersion[] = L"v1.3.0";
+constexpr wchar_t AppVersion[] = L"v1.5.2";
 constexpr wchar_t WindowClass[] = L"TrayAudio.Panel";
 constexpr wchar_t StartupKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t OptionsKey[] = L"Software\\TrayAudio";
@@ -27,6 +27,8 @@ constexpr wchar_t PositionName[] = L"PanelPosition";
 constexpr wchar_t SizeName[] = L"PanelSize";
 constexpr wchar_t ThemeName[] = L"ThemeIndex";
 constexpr wchar_t TransparencyName[] = L"TransparencyIndex";
+constexpr wchar_t PinnedOutputsName[] = L"PinnedOutputs";
+constexpr wchar_t PinnedInputsName[] = L"PinnedInputs";
 constexpr UINT TrayMessage = WM_APP + 2;
 constexpr UINT OpenPanel = WM_APP + 3;
 constexpr UINT_PTR ViewTimer = 1;
@@ -58,20 +60,23 @@ constexpr Palette Palettes[]{
         Color(0x1c352a), Color(0x415d50), Color(0xadbeaf), Color(0x1b7158), Color(0xf1fff9), Color(0x1b7158)},
 };
 
-constexpr int TransparencyLevels[]{0, 10, 20, 30, 40};
+constexpr int TransparencyLevels[]{0, 10, 20, 30, 40, 50, 60, 70, 80};
 constexpr DWORD DefaultTransparency = 2;
 constexpr UINT OpenCommand = 1, StartupCommand = 2, ExitCommand = 3, AboutCommand = 4;
 constexpr UINT ThemeCommand = 10, TransparencyCommand = 20, OutputCommand = 100;
 
-enum class Action { Mix, Voice, Back, Pin, Close, Device, Volume, Mute, Scroll };
+enum class Action {
+    Mix, Voice, Back, Pin, Close, Device, DeviceList, QuickDevice, PinDevice, Loopback, Volume, Mute, Scroll
+};
 enum class DeviceSlot { Output, Input, VoiceOutput, VoiceInput };
-enum class Glyph { Speaker, Mute, Mic, Back, Pin, Close, Chevron, App };
+enum class Glyph { Speaker, Mute, Mic, Back, Pin, Close, Chevron, ChevronUp, Check, App };
 
 struct Control {
     Action action;
     RECT rect;
     int index = -1;
     bool enabled = true;
+    DeviceSlot slot = DeviceSlot::Output;
 };
 
 struct DeviceChoice {
@@ -79,6 +84,12 @@ struct DeviceChoice {
     const std::wstring& current;
     EDataFlow flow;
     ERole role;
+};
+
+struct QuickDevices {
+    std::vector<std::wstring> pins;
+    std::vector<int> rows;
+    bool showAll = false;
 };
 
 class PaintBitmap {
@@ -366,6 +377,8 @@ public:
             savedSize_ = dimensions;
         theme_ = ReadOption(ThemeName, ARRAYSIZE(Palettes), 0);
         transparency_ = ReadOption(TransparencyName, ARRAYSIZE(TransparencyLevels), DefaultTransparency);
+        LoadDevicePins(DeviceSlot::Output);
+        LoadDevicePins(DeviceSlot::Input);
         audio_ = std::make_unique<AudioThread>(window_);
         return true;
     }
@@ -404,8 +417,19 @@ private:
             Show();
             return 0;
         case AudioUpdated:
-            if (IsWindowVisible(window_) && !about_ && !Interacting()) Refresh();
+            if (IsWindowVisible(window_) && !about_) {
+                if (!Interacting()) Refresh();
+                else if (monitor_.State() != MicMonitorState::Off) CheckMonitorRoute(audio_->Read(false));
+            }
             return 0;
+        case MicMonitorUpdated: {
+            const auto result = static_cast<HRESULT>(lParam);
+            if (monitor_.Update(wParam, result)) {
+                if (FAILED(result)) ShowMonitorError(result);
+                InvalidateRect(window_, nullptr, FALSE);
+            }
+            return 0;
+        }
         case WM_PAINT: {
             PAINTSTRUCT ps;
             HDC dc = BeginPaint(window_, &ps);
@@ -452,8 +476,11 @@ private:
                     const float peak = audio_->InputPeak();
                     if (std::abs(peak - view_.peak) > 0.003f) {
                         view_.peak = peak;
-                        RECT meter{Px(22), Px(194), width_ - Px(22), Px(217)};
-                        InvalidateRect(window_, &meter, FALSE);
+                        const int y = InputBottom() + Px(20) - scroll_;
+                        const RECT meter{Px(22), y - Px(10), width_ - Px(22), y + Px(10)};
+                        const RECT viewport = ContentViewport();
+                        RECT visible{};
+                        if (IntersectRect(&visible, &meter, &viewport)) InvalidateRect(window_, &visible, FALSE);
                     }
                 } else {
                     Refresh();
@@ -494,7 +521,7 @@ private:
             InvalidateRect(window_, nullptr, FALSE);
             return 0;
         case WM_MOUSEWHEEL:
-            if (!about_ && !voice_ && !Interacting()) {
+            if (!about_ && !Interacting()) {
                 wheel_ += GET_WHEEL_DELTA_WPARAM(wParam);
                 ScrollBy(-wheel_ / WHEEL_DELTA * Px(54));
                 wheel_ %= WHEEL_DELTA;
@@ -527,6 +554,7 @@ private:
             if (wParam) DestroyWindow(window_);
             return 0;
         case WM_DESTROY:
+            monitor_.Stop();
             Shell_NotifyIconW(NIM_DELETE, &tray_);
             glass_.reset();
             audio_.reset();
@@ -652,14 +680,20 @@ private:
 
     void Hide() {
         if (!IsWindowVisible(window_)) return;
+        monitor_.Stop();
         KillTimer(window_, ViewTimer);
         ShowWindow(window_, SW_HIDE);
         if (GetCapture() == window_) ReleaseCapture();
         hovered_ = focused_ = -1;
         keyFocus_ = false;
         about_ = false;
+        voice_ = false;
+        quickOutputs_.showAll = quickInputs_.showAll = false;
+        scroll_ = 0;
         ClearIcons();
         view_ = {};
+        quickOutputs_.rows.clear();
+        quickInputs_.rows.clear();
         controls_.clear();
     }
 
@@ -669,6 +703,7 @@ private:
     }
 
     void NavigateAbout(bool open) {
+        if (open) monitor_.Stop();
         about_ = open;
         hovered_ = focused_ = -1;
         keyFocus_ = false;
@@ -681,14 +716,15 @@ private:
     }
 
     void Refresh() {
-        const std::wstring focusKey = FocusKey();
-        Action focusAction = Action::Close;
-        int focusIndex = -1;
+        std::optional<Control> focus;
         if (focused_ >= 0 && focused_ < static_cast<int>(controls_.size())) {
-            focusAction = controls_[focused_].action;
-            focusIndex = controls_[focused_].index;
+            focus = controls_[focused_];
         }
+        const auto focusKey = focus ? ControlKey(*focus) : std::wstring{};
         view_ = about_ ? AudioView{} : audio_->Read(!voice_);
+        CheckMonitorRoute(view_);
+        UpdateQuickRows(DeviceSlot::Output);
+        UpdateQuickRows(DeviceSlot::Input);
         for (auto cached = icons_.begin(); cached != icons_.end();) {
             const bool displayed = std::ranges::any_of(view_.apps, [&](const MixerApp& app) {
                 return app.path == cached->first;
@@ -700,31 +736,127 @@ private:
             }
         }
         Layout();
-        if (!focusKey.empty()) {
-            focused_ = -1;
-            const auto app = std::ranges::find(view_.apps, focusKey, &MixerApp::key);
-            if (app != view_.apps.end()) {
-                focusIndex = static_cast<int>(app - view_.apps.begin());
-                for (int index = 0; index < static_cast<int>(controls_.size()); ++index)
-                    if (controls_[index].action == focusAction && controls_[index].index == focusIndex)
-                        focused_ = index;
-            }
+        if (focus) {
+            const auto match = std::ranges::find_if(controls_, [&](const Control& candidate) {
+                return candidate.action == focus->action && candidate.slot == focus->slot &&
+                       (focusKey.empty() ? candidate.index == focus->index : ControlKey(candidate) == focusKey);
+            });
+            focused_ = match == controls_.end() ? -1 : static_cast<int>(match - controls_.begin());
         }
         InvalidateRect(window_, nullptr, FALSE);
     }
 
-    std::wstring FocusKey() const {
-        if (focused_ < 0 || focused_ >= static_cast<int>(controls_.size())) return {};
-        const auto& control = controls_[focused_];
+    std::wstring ControlKey(const Control& control) const {
         if (IsAppControl(control) && control.index < static_cast<int>(view_.apps.size()))
             return view_.apps[control.index].key;
+        if (control.action == Action::QuickDevice || control.action == Action::PinDevice) {
+            const auto choice = Choice(view_, control.slot);
+            if (control.index >= 0 && control.index < static_cast<int>(choice.list.size()))
+                return choice.list[control.index].id;
+        }
         return {};
+    }
+
+    QuickDevices& QuickList(DeviceSlot slot) {
+        return slot == DeviceSlot::Input ? quickInputs_ : quickOutputs_;
+    }
+
+    const QuickDevices& QuickList(DeviceSlot slot) const {
+        return slot == DeviceSlot::Input ? quickInputs_ : quickOutputs_;
+    }
+
+    static PCWSTR PinValueName(DeviceSlot slot) {
+        return slot == DeviceSlot::Input ? PinnedInputsName : PinnedOutputsName;
+    }
+
+    void LoadDevicePins(DeviceSlot slot) {
+        DWORD bytes = 0;
+        const auto valueName = PinValueName(slot);
+        if (RegGetValueW(HKEY_CURRENT_USER, OptionsKey, valueName, RRF_RT_REG_MULTI_SZ,
+                         nullptr, nullptr, &bytes) != ERROR_SUCCESS || !bytes) return;
+        std::vector<wchar_t> data(bytes / sizeof(wchar_t) + 1, L'\0');
+        if (RegGetValueW(HKEY_CURRENT_USER, OptionsKey, valueName, RRF_RT_REG_MULTI_SZ,
+                         nullptr, data.data(), &bytes) != ERROR_SUCCESS) return;
+        auto& pins = QuickList(slot).pins;
+        for (const wchar_t* id = data.data(); *id; id += wcslen(id) + 1) {
+            if (!IsDevicePinned(slot, id)) pins.emplace_back(id);
+        }
+    }
+
+    bool IsDevicePinned(DeviceSlot slot, const std::wstring& id) const {
+        const auto& pins = QuickList(slot).pins;
+        return std::ranges::find(pins, id) != pins.end();
+    }
+
+    void UpdateQuickRows(DeviceSlot slot) {
+        auto& quick = QuickList(slot);
+        const auto choice = Choice(view_, slot);
+        quick.rows.clear();
+        if (quick.showAll) {
+            for (size_t index = 0; index < choice.list.size(); ++index)
+                quick.rows.push_back(static_cast<int>(index));
+            return;
+        }
+        const auto append = [&](const std::wstring& id) {
+            const auto device = std::ranges::find(choice.list, id, &DeviceInfo::id);
+            if (device != choice.list.end())
+                quick.rows.push_back(static_cast<int>(device - choice.list.begin()));
+        };
+        for (const auto& id : quick.pins) append(id);
+        if (!IsDevicePinned(slot, choice.current)) append(choice.current);
+    }
+
+    void ToggleDevicePin(DeviceSlot slot, int index) {
+        const auto choice = Choice(view_, slot);
+        if (index < 0 || index >= static_cast<int>(choice.list.size())) return;
+        auto& quick = QuickList(slot);
+        auto pins = quick.pins;
+        const auto& id = choice.list[index].id;
+        if (!std::erase(pins, id)) pins.push_back(id);
+        std::vector<wchar_t> value;
+        for (const auto& item : pins) {
+            value.insert(value.end(), item.begin(), item.end());
+            value.push_back(L'\0');
+        }
+        if (value.empty()) value.push_back(L'\0');
+        value.push_back(L'\0');
+        if (RegSetKeyValueW(HKEY_CURRENT_USER, OptionsKey, PinValueName(slot), REG_MULTI_SZ, value.data(),
+                            static_cast<DWORD>(value.size() * sizeof(wchar_t))) != ERROR_SUCCESS) {
+            Error(L"无法保存固定的音频设备");
+            return;
+        }
+        quick.pins = std::move(pins);
+        Refresh();
     }
 
     void Error(const std::wstring& message) {
         error_ = message;
         SetTimer(window_, ErrorTimer, 4500, nullptr);
         InvalidateRect(window_, nullptr, FALSE);
+    }
+
+    void CheckMonitorRoute(const AudioView& devices) {
+        if (monitor_.State() != MicMonitorState::Off &&
+            (devices.input != monitorInput_ || devices.output != monitorOutput_)) {
+            monitor_.Stop();
+            Error(L"音频设备已更改，回环测试已停止");
+        }
+    }
+
+    void ShowMonitorError(HRESULT result) {
+        if (result == E_ACCESSDENIED) Error(L"请在 Windows 设置中允许桌面应用访问麦克风");
+        else Error(L"回环测试未能继续，请检查输入和输出设备");
+    }
+
+    void ToggleMicMonitor() {
+        if (monitor_.State() != MicMonitorState::Off) {
+            monitor_.Stop();
+            return;
+        }
+        monitorInput_ = view_.input;
+        monitorOutput_ = view_.output;
+        const HRESULT result = monitor_.Start(window_, monitorInput_, monitorOutput_);
+        if (FAILED(result)) ShowMonitorError(result);
     }
 
     int Px(int value) const { return MulDiv(value, dpi_, 96); }
@@ -771,13 +903,31 @@ private:
         icons_.clear();
     }
 
-    RECT AppViewport() const {
-        return {Px(20), Px(266), width_ - Px(13), std::max(Px(266), height_ - Px(38))};
+    int QuickHeight(DeviceSlot slot) const {
+        const int count = std::max(1, static_cast<int>(QuickList(slot).rows.size()));
+        return (count - 1) * Px(44) + Px(39);
+    }
+
+    int OutputBottom() const { return Px(143) + QuickHeight(DeviceSlot::Output); }
+    int InputBottom() const { return Px(143) + QuickHeight(DeviceSlot::Input); }
+    int MonitorTop() const { return InputBottom() + Px(40); }
+    int VoiceOutputTop() const { return MonitorTop() + Px(93); }
+    int VoiceInputTop() const { return VoiceOutputTop() + Px(86); }
+    int AppTop() const { return OutputBottom() + Px(84) - scroll_; }
+
+    RECT ContentViewport() const {
+        return {Px(20), Px(143), width_ - Px(13), std::max(Px(143), height_ - Px(38))};
     }
 
     int ScrollLimit() const {
-        const RECT list = AppViewport();
-        return std::max(0, Px(61) * static_cast<int>(view_.apps.size()) - static_cast<int>(list.bottom - list.top));
+        const RECT list = ContentViewport();
+        const int appHeight = view_.apps.empty() ? Px(44) : Px(61) * static_cast<int>(view_.apps.size());
+        const int contentBottom = voice_ ? VoiceInputTop() + Px(44) : OutputBottom() + Px(84) + appHeight;
+        return std::max(0, contentBottom - static_cast<int>(list.bottom));
+    }
+
+    RECT DeviceListRect() const {
+        return {width_ - Px(100), Px(110), width_ - Px(22), Px(138)};
     }
 
     void Layout() {
@@ -793,36 +943,59 @@ private:
         if (about_) return;
         controls_.push_back({Action::Mix, Box(25, 58, 96, 89)});
         controls_.push_back({Action::Voice, Box(99, 58, 170, 89)});
+        scroll_ = std::clamp(scroll_, 0, ScrollLimit());
+        const auto slot = voice_ ? DeviceSlot::Input : DeviceSlot::Output;
+        controls_.push_back({Action::DeviceList, DeviceListRect(), -1,
+                             !Choice(view_, slot).list.empty() || QuickList(slot).showAll, slot});
+        LayoutQuickDevices(slot, Px(143), edge);
         if (voice_) {
-            controls_.push_back({Action::Device, {Px(22), Px(143), edge, Px(182)},
-                                 static_cast<int>(DeviceSlot::Input), !view_.inputs.empty()});
-            controls_.push_back({Action::Device, {Px(22), Px(264), edge, Px(303)},
+            const int monitorTop = MonitorTop() - scroll_;
+            controls_.push_back({Action::Loopback, {edge - Px(97), monitorTop + Px(11), edge - Px(11), monitorTop + Px(43)},
+                                 -1, monitor_.State() != MicMonitorState::Off || (!view_.input.empty() && !view_.output.empty())});
+            const int voiceOutput = VoiceOutputTop() - scroll_;
+            controls_.push_back({Action::Device, {Px(22), voiceOutput, edge, voiceOutput + Px(39)},
                                  static_cast<int>(DeviceSlot::VoiceOutput), !view_.outputs.empty()});
-            controls_.push_back({Action::Device, {Px(22), Px(355), edge, Px(394)},
+            const int voiceInput = VoiceInputTop() - scroll_;
+            controls_.push_back({Action::Device, {Px(22), voiceInput, edge, voiceInput + Px(39)},
                                  static_cast<int>(DeviceSlot::VoiceInput), !view_.inputs.empty()});
         } else {
-            controls_.push_back({Action::Device, {Px(22), Px(143), edge, Px(182)},
-                                 static_cast<int>(DeviceSlot::Output), !view_.outputs.empty()});
-            controls_.push_back({Action::Mute, Box(22, 193, 52, 223), -1, view_.volume >= 0});
-            controls_.push_back({Action::Volume, {Px(61), Px(193), width_ - Px(70), Px(223)},
+            const int bottom = OutputBottom() - scroll_;
+            controls_.push_back({Action::Mute, {Px(22), bottom + Px(11), Px(52), bottom + Px(41)},
                                  -1, view_.volume >= 0});
-            const RECT viewport = AppViewport();
-            scroll_ = std::clamp(scroll_, 0, ScrollLimit());
+            controls_.push_back({Action::Volume, {Px(61), bottom + Px(11), width_ - Px(70), bottom + Px(41)},
+                                 -1, view_.volume >= 0});
             for (int index = 0; index < static_cast<int>(view_.apps.size()); ++index) {
-                const int y = viewport.top - scroll_ + index * Px(61);
+                const int y = AppTop() + index * Px(61);
                 controls_.push_back({Action::Mute, {Px(65), y + Px(24), Px(89), y + Px(52)}, index});
                 controls_.push_back({Action::Volume, {Px(98), y + Px(24), width_ - Px(70), y + Px(52)}, index});
             }
-            if (ScrollLimit() > 0)
-                controls_.push_back({Action::Scroll, {width_ - Px(17), viewport.top,
-                                                      width_ - Px(7), viewport.bottom}});
         }
+        const RECT viewport = ContentViewport();
+        if (ScrollLimit() > 0)
+            controls_.push_back({Action::Scroll, {width_ - Px(17), viewport.top,
+                                                  width_ - Px(7), viewport.bottom}});
         if (focused_ >= static_cast<int>(controls_.size())) focused_ = -1;
         if (hovered_ >= static_cast<int>(controls_.size())) hovered_ = -1;
     }
 
+    void LayoutQuickDevices(DeviceSlot slot, int top, int edge) {
+        const auto& rows = QuickList(slot).rows;
+        const int split = edge - Px(39);
+        for (int row = 0; row < static_cast<int>(rows.size()); ++row) {
+            const int y = top + row * Px(44) - scroll_;
+            controls_.push_back({Action::QuickDevice, {Px(22), y, split, y + Px(39)}, rows[row], true, slot});
+            controls_.push_back({Action::PinDevice, {split, y, edge, y + Px(39)}, rows[row], true, slot});
+        }
+    }
+
     static bool IsAppControl(const Control& control) {
         return control.index >= 0 && (control.action == Action::Volume || control.action == Action::Mute);
+    }
+
+    static bool IsContentControl(const Control& control) {
+        return control.action == Action::QuickDevice || control.action == Action::PinDevice ||
+               control.action == Action::Volume || control.action == Action::Mute ||
+               control.action == Action::Device || control.action == Action::Loopback;
     }
 
     bool Interacting() const {
@@ -830,10 +1003,10 @@ private:
     }
 
     int Hit(POINT point) const {
-        const RECT list = AppViewport();
+        const RECT list = ContentViewport();
         for (int index = 0; index < static_cast<int>(controls_.size()); ++index) {
             const auto& control = controls_[index];
-            if (IsAppControl(control) && !PtInRect(&list, point)) continue;
+            if (IsContentControl(control) && !PtInRect(&list, point)) continue;
             if (control.enabled && PtInRect(&control.rect, point)) return index;
         }
         return -1;
@@ -894,7 +1067,7 @@ private:
     }
 
     void ScrollTo(int y) {
-        const RECT list = AppViewport();
+        const RECT list = ContentViewport();
         const int range = std::max(1L, list.bottom - list.top);
         const int next = MulDiv(std::clamp<int>(y - list.top, 0, range), ScrollLimit(), range);
         ScrollBy(next - scroll_);
@@ -921,7 +1094,9 @@ private:
         switch (control.action) {
         case Action::Mix:
         case Action::Voice:
+            if (voice_ != (control.action == Action::Voice)) scroll_ = 0;
             voice_ = control.action == Action::Voice;
+            if (!voice_) monitor_.Stop();
             Refresh();
             StartTimer();
             break;
@@ -936,6 +1111,23 @@ private:
             break;
         case Action::Device:
             DeviceMenu(static_cast<DeviceSlot>(control.index), control.rect);
+            break;
+        case Action::DeviceList: {
+            auto& list = QuickList(control.slot);
+            list.showAll = !list.showAll;
+            scroll_ = 0;
+            Refresh();
+            break;
+        }
+        case Action::QuickDevice:
+            Switch(Choice(view_, control.slot), control.index);
+            Refresh();
+            break;
+        case Action::PinDevice:
+            ToggleDevicePin(control.slot, control.index);
+            break;
+        case Action::Loopback:
+            ToggleMicMonitor();
             break;
         case Action::Mute: {
             bool& muted = control.index < 0 ? view_.muted : view_.apps[control.index].muted;
@@ -965,9 +1157,9 @@ private:
                 next = (next + direction + count) % count;
             } while (!controls_[next].enabled || controls_[next].action == Action::Scroll);
             focused_ = next;
-            if (IsAppControl(controls_[next])) {
+            if (IsContentControl(controls_[next])) {
                 const RECT rect = controls_[next].rect;
-                const RECT list = AppViewport();
+                const RECT list = ContentViewport();
                 if (rect.top < list.top) ScrollBy(rect.top - list.top);
                 else if (rect.bottom > list.bottom) ScrollBy(rect.bottom - list.bottom);
             }
@@ -982,7 +1174,7 @@ private:
                 if (key == VK_END) level = 100;
                 SetVolume(control, std::clamp(level, 0, 100));
             } else if (key == VK_RETURN || key == VK_SPACE ||
-                       (key == VK_DOWN && control.action == Action::Device)) {
+                       (key == VK_DOWN && (control.action == Action::Device || control.action == Action::DeviceList))) {
                 Activate(control);
             }
         }
@@ -1023,6 +1215,7 @@ private:
 
     void Switch(const DeviceChoice& choice, size_t index) {
         if (index >= choice.list.size() || choice.list[index].id == choice.current) return;
+        if (choice.role == eMultimedia) monitor_.Stop();
         if (FAILED(audio_->SetDevice(choice.flow, choice.role, choice.list[index].id))) {
             if (IsWindowVisible(window_)) Error(L"切换失败，请检查设备连接");
             else MessageBoxW(window_, L"切换失败，请检查设备连接。", AppName, MB_OK | MB_ICONWARNING);
@@ -1207,6 +1400,12 @@ private:
         case Glyph::Chevron:
             line({point(4, 8), point(10, 14), point(16, 8)});
             break;
+        case Glyph::ChevronUp:
+            line({point(4, 12), point(10, 6), point(16, 12)});
+            break;
+        case Glyph::Check:
+            line({point(4, 10), point(8, 14), point(16, 6)});
+            break;
         case Glyph::App: {
             const POINT left = point(3, 4), right = point(18, 16);
             RoundRect(dc, left.x, left.y, right.x, right.y, Px(4), Px(4));
@@ -1298,24 +1497,14 @@ private:
         if (!about_) Round(dc, Box(22, 55, 173, 92), 15, colors.card, colors.cardBorder);
         if (about_) {
             DrawAbout(context);
-        } else if (voice_) {
-            Label(context, Box(22, 112, 370, 137), L"Windows 默认输入", medium_);
-            Label(context, Box(22, 233, 370, 258), L"默认通信输出", medium_);
-            Label(context, Box(22, 324, 370, 349), L"默认通信输入", medium_);
-            Symbol(dc, Px(33), Px(205), Glyph::Mic, colors.secondary, 18);
-            const int left = Px(55), right = width_ - Px(22);
-            Round(dc, {left, Px(203), right, Px(208)}, 5, colors.track);
-            const int end = left + static_cast<int>((right - left) * std::clamp(view_.peak, 0.0f, 1.0f));
-            if (end > left) Round(dc, {left, Px(203), end, Px(208)}, 5, colors.progress);
         } else {
-            Label(context, Box(22, 112, 370, 137), L"Windows 默认输出", medium_);
-            Fill(dc, {Px(22), Px(229), width_ - Px(22), Px(229) + 1}, colors.cardBorder);
-            Label(context, Box(22, 237, 370, 261), L"应用音量", medium_);
-            DrawApps(context);
+            Label(context, {Px(22), Px(112), DeviceListRect().left - Px(8), Px(137)},
+                  voice_ ? L"Windows 默认输入" : L"Windows 默认输出", medium_);
+            DrawContent(context);
         }
         for (int index = 0; index < static_cast<int>(controls_.size()); ++index) {
             const auto& control = controls_[index];
-            if (!IsAppControl(control)) DrawControl(context, index);
+            if (!IsContentControl(control)) DrawControl(context, index);
         }
         if (!error_.empty())
             Label(context, {Px(22), height_ - Px(26), width_ - Px(20), height_ - Px(5)},
@@ -1345,18 +1534,79 @@ private:
               L"界面字体 · 小米 MiSans", small_, colors.secondary, DT_CENTER);
     }
 
-    void DrawApps(const DrawContext& context) {
+    void DrawContent(const DrawContext& context) {
         const HDC dc = context.dc;
-        const auto& colors = Colors();
-        const RECT list = AppViewport();
+        const RECT list = ContentViewport();
         const int previous = SaveDC(dc);
         IntersectClipRect(dc, list.left, list.top, list.right, list.bottom);
+        if (voice_) {
+            DrawVoice(context);
+        } else {
+            const int appsTop = AppTop();
+            Fill(dc, {Px(22), appsTop - Px(36), width_ - Px(22), appsTop - Px(36) + 1}, Colors().cardBorder);
+            Label(context, {Px(22), appsTop - Px(29), width_ - Px(22), appsTop - Px(5)}, L"应用音量", medium_);
+            if (quickOutputs_.rows.empty())
+                DrawMissingDevice(context, Px(143) - scroll_, !view_.outputs.empty());
+            DrawApps(context, list);
+        }
+        for (int index = 0; index < static_cast<int>(controls_.size()); ++index) {
+            const auto& control = controls_[index];
+            if (IsContentControl(control) && control.rect.bottom >= list.top && control.rect.top < list.bottom)
+                DrawControl(context, index);
+        }
+        RestoreDC(dc, previous);
+    }
+
+    void DrawVoice(const DrawContext& context) {
+        const HDC dc = context.dc;
+        const auto& colors = Colors();
+        const int edge = width_ - Px(22);
+        if (quickInputs_.rows.empty())
+            DrawMissingDevice(context, Px(143) - scroll_, !view_.inputs.empty());
+        const int meter = InputBottom() + Px(20) - scroll_;
+        Symbol(dc, Px(33), meter, Glyph::Mic, colors.secondary, 18);
+        const int left = Px(55);
+        Round(dc, {left, meter - Px(2), edge, meter + Px(3)}, 5, colors.track);
+        const int end = left + static_cast<int>((edge - left) * std::clamp(view_.peak, 0.0f, 1.0f));
+        if (end > left) Round(dc, {left, meter - Px(2), end, meter + Px(3)}, 5, colors.progress);
+
+        const int test = MonitorTop() - scroll_;
+        Round(dc, {Px(22), test, edge, test + Px(54)}, 13, colors.card, colors.cardBorder);
+        Label(context, {Px(34), test + Px(7), edge - Px(105), test + Px(28)},
+              L"麦克风回环测试", medium_);
+        const auto output = std::ranges::find(view_.outputs, view_.output, &DeviceInfo::id);
+        std::wstring route = L"请先选择默认输出";
+        if (view_.input.empty()) route = L"请先选择麦克风";
+        else if (output != view_.outputs.end()) route = L"播放到 " + output->name;
+        Label(context, {Px(34), test + Px(29), edge - Px(105), test + Px(47)},
+              route, small_, colors.secondary);
+
+        const int voiceOutput = VoiceOutputTop() - scroll_;
+        const int voiceInput = VoiceInputTop() - scroll_;
+        Label(context, {Px(22), voiceOutput - Px(29), edge, voiceOutput - Px(5)},
+              L"默认通信输出", medium_);
+        Label(context, {Px(22), voiceInput - Px(29), edge, voiceInput - Px(5)},
+              L"默认通信输入", medium_);
+    }
+
+    void DrawMissingDevice(const DrawContext& context, int y, bool hasDevices) {
+        const auto& colors = Colors();
+        const RECT rect{Px(22), y, width_ - Px(22), y + Px(39)};
+        Round(context.dc, rect, 13, colors.card, colors.border);
+        Label(context, {rect.left + Px(12), rect.top, rect.right - Px(12), rect.bottom},
+              hasDevices ? L"选择一个设备" : L"无可用设备", normal_, colors.secondary);
+    }
+
+    void DrawApps(const DrawContext& context, const RECT& list) {
+        const HDC dc = context.dc;
+        const auto& colors = Colors();
+        const int top = AppTop();
         if (view_.apps.empty()) {
-            Label(context, {Px(22), list.top + Px(8), width_ - Px(22), list.top + Px(40)},
+            Label(context, {Px(22), top + Px(8), width_ - Px(22), top + Px(40)},
                   L"播放声音后，应用会显示在这里", normal_, colors.secondary);
         }
         for (int index = 0; index < static_cast<int>(view_.apps.size()); ++index) {
-            const int y = list.top - scroll_ + index * Px(61);
+            const int y = top + index * Px(61);
             if (y + Px(60) < list.top || y >= list.bottom) continue;
             const auto& app = view_.apps[index];
             Round(dc, {Px(22), y + Px(1), width_ - Px(22), y + Px(57)}, 14, colors.card, colors.cardBorder);
@@ -1367,12 +1617,6 @@ private:
                 Symbol(dc, Px(43), y + Px(26), app.system ? Glyph::Speaker : Glyph::App, colors.text, 18);
             Label(context, {Px(66), y + Px(2), width_ - Px(32), y + Px(27)}, app.name, normal_);
         }
-        for (int index = 0; index < static_cast<int>(controls_.size()); ++index) {
-            const auto& control = controls_[index];
-            if (IsAppControl(control) && control.rect.bottom >= list.top && control.rect.top < list.bottom)
-                DrawControl(context, index);
-        }
-        RestoreDC(dc, previous);
     }
 
     void DrawControl(const DrawContext& context, int index) {
@@ -1419,6 +1663,51 @@ private:
             Symbol(dc, rect.right - Px(18), cy, Glyph::Chevron, colors.secondary, 18);
             break;
         }
+        case Action::DeviceList: {
+            const bool input = control.slot == DeviceSlot::Input;
+            const bool expanded = QuickList(control.slot).showAll;
+            const auto ink = control.enabled ? colors.text : colors.secondary;
+            Round(dc, rect, 10, hover || expanded ? colors.hover : colors.card,
+                  focus ? colors.progress : colors.cardBorder);
+            Symbol(dc, rect.left + Px(15), cy, input ? Glyph::Mic : Glyph::Speaker, ink, 15);
+            Label(context, {rect.left + Px(27), rect.top, rect.right - Px(24), rect.bottom},
+                  input ? L"输入" : L"输出", small_, ink, DT_CENTER);
+            Symbol(dc, rect.right - Px(14), cy, expanded ? Glyph::ChevronUp : Glyph::Chevron, ink, 14);
+            break;
+        }
+        case Action::QuickDevice: {
+            const auto choice = Choice(view_, control.slot);
+            const auto& device = choice.list[control.index];
+            const bool current = device.id == choice.current;
+            const RECT card{rect.left, rect.top, width_ - Px(22), rect.bottom};
+            Round(dc, card, 13, hover ? colors.hover : colors.card,
+                  current || focus ? colors.progress : colors.border);
+            const auto deviceIcon = control.slot == DeviceSlot::Input ? Glyph::Mic : Glyph::Speaker;
+            Symbol(dc, rect.left + Px(17), cy, current ? Glyph::Check : deviceIcon,
+                   current ? colors.progress : colors.secondary, 17);
+            Label(context, {rect.left + Px(32), rect.top, rect.right - Px(6), rect.bottom},
+                  device.name, normal_);
+            break;
+        }
+        case Action::Loopback: {
+            const bool playing = monitor_.State() == MicMonitorState::Playing;
+            const bool starting = monitor_.State() == MicMonitorState::Starting;
+            const bool emphasized = control.enabled && !playing && !starting;
+            const COLORREF fill = emphasized ? colors.accent : (hover || playing || starting ? colors.hover : colors.card);
+            const COLORREF ink = emphasized ? colors.accentInk : (control.enabled ? colors.text : colors.secondary);
+            Round(dc, rect, 10, fill, focus || playing ? colors.progress : colors.cardBorder);
+            Label(context, rect, playing ? L"停止测试" : (starting ? L"取消启动" : L"开始测试"), small_, ink, DT_CENTER);
+            break;
+        }
+        case Action::PinDevice: {
+            const auto& device = Choice(view_, control.slot).list[control.index];
+            const bool pinned = IsDevicePinned(control.slot, device.id);
+            const RECT icon{rect.left + Px(5), rect.top + Px(6), rect.right - Px(5), rect.bottom - Px(6)};
+            if (hover || focus || pinned)
+                Round(dc, icon, 8, colors.hover, focus ? colors.progress : CLR_INVALID);
+            Symbol(dc, cx, cy, Glyph::Pin, pinned ? colors.progress : colors.secondary, 18);
+            break;
+        }
         case Action::Mute: {
             const bool muted = control.index < 0 ? view_.muted : view_.apps[control.index].muted;
             if (hover || focus) Round(dc, rect, 7, colors.hover, focus ? colors.progress : CLR_INVALID);
@@ -1453,8 +1742,11 @@ private:
     NOTIFYICONDATAW tray_{};
     UINT taskbarCreated_ = 0;
     std::unique_ptr<AudioThread> audio_;
+    MicMonitor monitor_;
+    std::wstring monitorInput_, monitorOutput_;
     std::unique_ptr<PanelGlass> glass_;
     AudioView view_;
+    QuickDevices quickOutputs_, quickInputs_;
     std::vector<Control> controls_;
     std::map<std::wstring, HICON> icons_;
     std::wstring error_;

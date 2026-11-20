@@ -1,6 +1,7 @@
 #include "Audio.h"
 
 #include <appmodel.h>
+#include <audioclient.h>
 #include <audiopolicy.h>
 #include <endpointvolume.h>
 #include <functiondiscoverykeys_devpkey.h>
@@ -8,12 +9,15 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <future>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <system_error>
 
 using Microsoft::WRL::ComPtr;
 
@@ -52,6 +56,135 @@ template<class Interface>
 HRESULT Activate(IMMDevice* device, ComPtr<Interface>& result) {
     return device->Activate(__uuidof(Interface), CLSCTX_ALL, nullptr,
                             reinterpret_cast<void**>(result.ReleaseAndGetAddressOf()));
+}
+
+constexpr DWORD MonitorSampleRate = 48000;
+
+class MonitorSamples {
+public:
+    void Push(const int16_t* samples, size_t frames) {
+        const size_t skipped = frames > data_.size() ? frames - data_.size() : 0;
+        frames -= skipped;
+        if (size_ + frames > data_.size()) Discard(size_ + frames - data_.size());
+        for (size_t index = 0; index < frames; ++index)
+            data_[(first_ + size_ + index) % data_.size()] = samples ? samples[skipped + index] : 0;
+        size_ += frames;
+    }
+
+    DWORD Render(int16_t* samples, size_t frames) {
+        if (!size_) return AUDCLNT_BUFFERFLAGS_SILENT;
+        const size_t copied = std::min(frames, size_);
+        for (size_t index = 0; index < copied; ++index)
+            samples[index] = data_[(first_ + index) % data_.size()];
+        std::fill(samples + copied, samples + frames, int16_t{0});
+        Discard(copied);
+        return 0;
+    }
+
+private:
+    void Discard(size_t frames) {
+        first_ = (first_ + frames) % data_.size();
+        size_ -= frames;
+    }
+
+    std::array<int16_t, MonitorSampleRate / 20> data_{};
+    size_t first_ = 0;
+    size_t size_ = 0;
+};
+
+struct AudioReadyEvent {
+    HANDLE handle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    DWORD error = handle ? ERROR_SUCCESS : GetLastError();
+    ~AudioReadyEvent() { if (handle) CloseHandle(handle); }
+};
+
+HRESULT OpenMonitorClient(IMMDeviceEnumerator* devices, const std::wstring& id, HANDLE ready,
+                          DWORD flags, ComPtr<IAudioClient>& client) {
+    ComPtr<IMMDevice> device;
+    HRESULT hr = devices->GetDevice(id.c_str(), &device);
+    if (FAILED(hr)) return hr;
+    hr = Activate(device.Get(), client);
+    if (FAILED(hr)) return hr;
+    const WAVEFORMATEX format{WAVE_FORMAT_PCM, 1, MonitorSampleRate, MonitorSampleRate * 2, 2, 16, 0};
+    const DWORD options = AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
+                          AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY | flags;
+    hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, options, 200000, 0, &format, nullptr);
+    return SUCCEEDED(hr) ? client->SetEventHandle(ready) : hr;
+}
+
+HRESULT ReadMonitorSamples(IAudioCaptureClient* input, MonitorSamples& samples) {
+    UINT32 pending = 0;
+    HRESULT hr = input->GetNextPacketSize(&pending);
+    while (SUCCEEDED(hr) && pending) {
+        BYTE* buffer = nullptr;
+        DWORD flags = 0;
+        UINT32 frames = 0;
+        hr = input->GetBuffer(&buffer, &frames, &flags, nullptr, nullptr);
+        if (FAILED(hr)) return hr;
+        if (hr == AUDCLNT_S_BUFFER_EMPTY) return S_OK;
+        samples.Push(flags & AUDCLNT_BUFFERFLAGS_SILENT ? nullptr : reinterpret_cast<int16_t*>(buffer), frames);
+        hr = input->ReleaseBuffer(frames);
+        if (FAILED(hr)) return hr;
+        hr = input->GetNextPacketSize(&pending);
+    }
+    return hr;
+}
+
+HRESULT WriteMonitorSamples(IAudioClient* client, IAudioRenderClient* output, UINT32 capacity,
+                            MonitorSamples& samples) {
+    UINT32 padding = 0;
+    HRESULT hr = client->GetCurrentPadding(&padding);
+    if (FAILED(hr) || padding >= capacity) return hr;
+    const UINT32 frames = capacity - padding;
+    BYTE* buffer = nullptr;
+    hr = output->GetBuffer(frames, &buffer);
+    if (FAILED(hr)) return hr;
+    return output->ReleaseBuffer(frames, samples.Render(reinterpret_cast<int16_t*>(buffer), frames));
+}
+
+HRESULT RunMicMonitor(HWND panel, WPARAM generation, HANDLE stop, const std::wstring& inputId,
+                      const std::wstring& outputId) {
+    AudioReadyEvent inputReady, outputReady;
+    if (inputReady.error) return HRESULT_FROM_WIN32(inputReady.error);
+    if (outputReady.error) return HRESULT_FROM_WIN32(outputReady.error);
+    ComPtr<IMMDeviceEnumerator> devices;
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&devices));
+    if (FAILED(hr)) return hr;
+    ComPtr<IAudioClient> inputClient, outputClient;
+    hr = OpenMonitorClient(devices.Get(), inputId, inputReady.handle, 0, inputClient);
+    if (FAILED(hr)) return hr;
+    hr = OpenMonitorClient(devices.Get(), outputId, outputReady.handle, AUDCLNT_STREAMFLAGS_NOPERSIST, outputClient);
+    if (FAILED(hr)) return hr;
+    ComPtr<IAudioCaptureClient> input;
+    ComPtr<IAudioRenderClient> output;
+    if (FAILED(hr = inputClient->GetService(IID_PPV_ARGS(&input)))) return hr;
+    if (FAILED(hr = outputClient->GetService(IID_PPV_ARGS(&output)))) return hr;
+    UINT32 capacity = 0;
+    if (FAILED(hr = outputClient->GetBufferSize(&capacity))) return hr;
+    MonitorSamples samples;
+    if (FAILED(hr = WriteMonitorSamples(outputClient.Get(), output.Get(), capacity, samples))) return hr;
+    if (WaitForSingleObject(stop, 0) == WAIT_OBJECT_0) return S_FALSE;
+    if (FAILED(hr = inputClient->Start())) return hr;
+    if (FAILED(hr = outputClient->Start())) {
+        inputClient->Stop();
+        return hr;
+    }
+
+    PostMessageW(panel, MicMonitorUpdated, generation, S_OK);
+    HANDLE events[]{stop, inputReady.handle, outputReady.handle};
+    for (;;) {
+        const auto ready = WaitForMultipleObjects(ARRAYSIZE(events), events, FALSE, INFINITE);
+        if (ready == WAIT_OBJECT_0) break;
+        if (ready == WAIT_FAILED) {
+            hr = HRESULT_FROM_WIN32(GetLastError());
+            break;
+        }
+        if (FAILED(hr = ReadMonitorSamples(input.Get(), samples))) break;
+        if (FAILED(hr = WriteMonitorSamples(outputClient.Get(), output.Get(), capacity, samples))) break;
+    }
+    outputClient->Stop();
+    inputClient->Stop();
+    return FAILED(hr) ? hr : S_FALSE;
 }
 
 template<class Interface>
@@ -689,6 +822,48 @@ float AudioThread::InputPeak() {
     float peak = 0;
     Call([&](Engine& engine) { peak = engine.Peak(); });
     return peak;
+}
+
+MicMonitor::~MicMonitor() { Stop(); }
+
+HRESULT MicMonitor::Start(HWND panel, const std::wstring& input, const std::wstring& output) {
+    if (input.empty() || output.empty()) return E_INVALIDARG;
+    if (state_ != MicMonitorState::Off) return S_FALSE;
+    stop_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!stop_) return HRESULT_FROM_WIN32(GetLastError());
+    const auto generation = ++generation_;
+    state_ = MicMonitorState::Starting;
+    try {
+        worker_ = std::thread([panel, generation, stop = stop_, input, output] {
+            HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            if (SUCCEEDED(hr)) {
+                hr = RunMicMonitor(panel, generation, stop, input, output);
+                CoUninitialize();
+            }
+            if (FAILED(hr)) PostMessageW(panel, MicMonitorUpdated, generation, static_cast<LPARAM>(hr));
+        });
+    } catch (const std::system_error&) {
+        Stop();
+        return HRESULT_FROM_WIN32(ERROR_NOT_ENOUGH_MEMORY);
+    }
+    return S_OK;
+}
+
+void MicMonitor::Stop() {
+    if (!stop_) return;
+    ++generation_;
+    SetEvent(stop_);
+    if (worker_.joinable()) worker_.join();
+    CloseHandle(stop_);
+    stop_ = nullptr;
+    state_ = MicMonitorState::Off;
+}
+
+bool MicMonitor::Update(WPARAM generation, HRESULT result) {
+    if (generation != generation_ || state_ == MicMonitorState::Off) return false;
+    if (FAILED(result)) Stop();
+    else state_ = MicMonitorState::Playing;
+    return true;
 }
 
 HRESULT AudioThread::SetDevice(EDataFlow flow, ERole role, const std::wstring& id) {

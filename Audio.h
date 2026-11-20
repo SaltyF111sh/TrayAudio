@@ -9,6 +9,7 @@
 #include <vector>
 
 constexpr UINT AudioUpdated = WM_APP + 1;
+constexpr UINT MicMonitorUpdated = WM_APP + 4;
 
 struct DeviceInfo {
     std::wstring id;
@@ -58,4 +59,25 @@ private:
     void Call(const std::function<void(Engine&)>& action);
     HWND window_ = nullptr;
     std::thread thread_;
+};
+
+enum class MicMonitorState { Off, Starting, Playing };
+
+class MicMonitor {
+public:
+    MicMonitor() = default;
+    ~MicMonitor();
+    MicMonitor(const MicMonitor&) = delete;
+    MicMonitor& operator=(const MicMonitor&) = delete;
+
+    HRESULT Start(HWND panel, const std::wstring& input, const std::wstring& output);
+    void Stop();
+    bool Update(WPARAM generation, HRESULT result);
+    MicMonitorState State() const { return state_; }
+
+private:
+    HANDLE stop_ = nullptr;
+    std::thread worker_;
+    WPARAM generation_ = 0;
+    MicMonitorState state_ = MicMonitorState::Off;
 };
